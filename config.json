@@ -1,0 +1,154 @@
+{
+    "image_classifier": {
+        "supported_formats": [
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".bmp",
+            ".gif",
+            ".webp",
+            ".tiff"
+        ],
+        "default_key_bindings": {
+            "A": "AF",
+            "b": "BM",
+            "B": "BM_BK",
+            "c": "BC",
+            "C": "SC",
+            "D": "G_DT",
+            "e": "TH_SE",
+            "f": "FB",
+            "g": "GE",
+            "G": "TP_GE",
+            "h": "PH",
+            "H": "TH",
+            "k": "INK",
+            "l": "SL",
+            "L": "LB",
+            "m": "TM",
+            "M": "G_BM",
+            "n": "G_UN",
+            "N": "NL",
+            "o": "OI",
+            "O": "OK",
+            "p": "PR_GE",
+            "P": "PR_TM",
+            "r": "RD",
+            "s": "SP",
+            "t": "PT",
+            "T": "DT",
+            "w": "GE_WS",
+            "/": "UN",
+            ".": "不要了",
+            ">": "可要可不要",
+            ";": "待确认"
+        },
+        "binding_profiles": {
+            "default": {
+                "g": "GE",
+                "n": "G_UN",
+                "N": "INK",
+                "/": "UN",
+                "9": "78",
+                ".": "不要了"
+            },
+            "ARS_F6570": {
+                "A": "AF",
+                "b": "BM",
+                "B": "BM_BK",
+                "c": "BC",
+                "C": "SC",
+                "D": "G_DT",
+                "e": "TH_SE",
+                "f": "FB",
+                "g": "GE",
+                "G": "TP_GE",
+                "h": "PH",
+                "H": "TH",
+                "k": "INK",
+                "l": "SL",
+                "L": "LB",
+                "m": "TM",
+                "M": "G_BM",
+                "n": "G_UN",
+                "N": "NL",
+                "o": "OI",
+                "O": "OK",
+                "p": "PR_GE",
+                "P": "PR_TM",
+                "r": "RD",
+                "s": "SP",
+                "t": "PT",
+                "T": "DT",
+                "w": "GE_WS",
+                "/": "UN",
+                ".": "不要了",
+                ">": "可要可不要",
+                ";": "待确认"
+            },
+            "ADC_A9950": {
+                "e": "M2_WE_OP_G",
+                "E": "M2_WE_OP_L",
+                "o": "T3_XX_PO_G",
+                "p": "M1_SP_PI_P",
+                "P": "M2_SP_PI_P",
+                "q": "M1_PH_QK_G",
+                "t": "T3_SP_PI_G",
+                "T": "T3_SP_PI_P",
+                "2": "M1_PH_F2_P",
+                ".": "不要了",
+                "/": "UN"
+            }
+        },
+        "active_binding_profile": "ARS_F6570",
+        "window_size": [
+            1200,
+            800
+        ],
+        "shortcuts": {
+            "next": {
+                "keys": [
+                    "d",
+                    "Right",
+                    "Down"
+                ]
+            },
+            "previous": {
+                "keys": [
+                    "a",
+                    "Left",
+                    "Up"
+                ]
+            },
+            "skip": {
+                "keys": [
+                    "Control-s"
+                ]
+            },
+            "undo": {
+                "keys": [
+                    "u"
+                ]
+            },
+            "refresh": {
+                "keys": [
+                    "F5"
+                ]
+            },
+            "open_folder": {
+                "keys": [
+                    "Control-o"
+                ]
+            },
+            "exit": {
+                "keys": [
+                    "Escape"
+                ]
+            }
+        },
+        "zoom_end_delay": 150,
+        "use_fast_zoom": true,
+        "classification_columns": 2,
+        "move_xml_pairs": true
+    }
+}

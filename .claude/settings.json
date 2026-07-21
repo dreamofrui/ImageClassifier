@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__gitnexus__context",
+      "Bash(QT_QPA_PLATFORM=offscreen D:/miniforge3/envs/tool/python.exe -c ' *)"
+    ]
+  }
+}
