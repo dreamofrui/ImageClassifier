@@ -552,6 +552,92 @@ class ClassifierCoreTest(unittest.TestCase):
             self.assertEqual(session.images, images_before)
             self.assertEqual(session.current_index, current_index_before)
 
+    def test_classify_current_cleans_up_duplicate_when_copy_succeeds_but_unlink_fails(self):
+        """Test that duplicate files are cleaned up when shutil.move's unlink fails."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pending"
+            target = root / "classified"
+            source.mkdir()
+            (source / "a.jpg").write_bytes(b"a")
+            session = ClassifierSession(
+                source_folder=source,
+                target_folder=target,
+                supported_formats=[".jpg"],
+                key_bindings={"p": "PT"},
+            )
+            session.refresh()
+
+            # Mock shutil.move to simulate copy success + unlink failure
+            original_move = shutil.move
+            call_count = [0]
+
+            def mock_move(src, dst):
+                call_count[0] += 1
+                if call_count[0] == 1:  # First call: image move
+                    # Simulate copy+unlink where copy succeeds but unlink fails
+                    shutil.copy2(src, dst)
+                    raise OSError("Simulated unlink failure")
+                return original_move(src, dst)
+
+            with patch("classifier_core.shutil.move", side_effect=mock_move):
+                with self.assertRaises(MoveFailedError):
+                    session.classify_current("p")
+
+            # Verify: source should still exist, target should be cleaned up
+            self.assertTrue((source / "a.jpg").exists(), "Source file should still exist")
+            self.assertFalse(
+                (target / "PT" / "a.jpg").exists(),
+                "Duplicate target file should be cleaned up",
+            )
+            self.assertEqual(len(session.history), 0, "History should be empty after failed move")
+
+    def test_undo_last_cleans_up_duplicate_when_copy_succeeds_but_unlink_fails(self):
+        """Test that duplicate files are cleaned up during undo when unlink fails."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "pending"
+            target = root / "classified"
+            source.mkdir()
+            (source / "a.jpg").write_bytes(b"a")
+            session = ClassifierSession(
+                source_folder=source,
+                target_folder=target,
+                supported_formats=[".jpg"],
+                key_bindings={"p": "PT"},
+            )
+            session.refresh()
+            moved = session.classify_current("p")
+
+            # Mock shutil.move for undo operation
+            original_move = shutil.move
+            call_count = [0]
+
+            def mock_move(src, dst):
+                call_count[0] += 1
+                if call_count[0] == 1:  # First call during undo: restore image
+                    # Simulate copy+unlink where copy succeeds but unlink fails
+                    shutil.copy2(src, dst)
+                    raise OSError("Simulated unlink failure during undo")
+                return original_move(src, dst)
+
+            with patch("classifier_core.shutil.move", side_effect=mock_move):
+                with self.assertRaises(MoveFailedError):
+                    session.undo_last()
+
+            # Verify: target should still exist, duplicate source should be cleaned up
+            self.assertTrue(
+                (target / "PT" / "a.jpg").exists(),
+                "Target file should still exist after failed undo",
+            )
+            self.assertFalse(
+                (source / "a.jpg").exists(),
+                "Duplicate source file should be cleaned up",
+            )
+            self.assertEqual(
+                len(session.history), 1, "History should still contain the original move"
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

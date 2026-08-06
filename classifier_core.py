@@ -153,19 +153,44 @@ class ClassifierSession:
         )
 
         image_moved = False
+        xml_moved = False
         try:
             category_dir.mkdir(parents=True, exist_ok=True)
             shutil.move(str(source), str(target))
             image_moved = True
             if xml_source is not None and xml_target is not None:
                 shutil.move(str(xml_source), str(xml_target))
+                xml_moved = True
         except Exception as exc:
             rollback_error = None
+            # Rollback: if image was successfully moved, restore it
             if image_moved and target.exists() and not source.exists():
                 try:
                     shutil.move(str(target), str(source))
                 except Exception as rollback_exc:
                     rollback_error = rollback_exc
+            # Cleanup: if copy succeeded but unlink failed, remove the duplicate
+            elif target.exists() and source.exists():
+                try:
+                    target.unlink()
+                except Exception as cleanup_exc:
+                    rollback_error = cleanup_exc
+            # Handle XML duplicate cleanup
+            if xml_source is not None and xml_target is not None:
+                if xml_moved and xml_target.exists() and not xml_source.exists():
+                    # XML was moved, try to restore
+                    if rollback_error is None:
+                        try:
+                            shutil.move(str(xml_target), str(xml_source))
+                        except Exception as rollback_exc:
+                            rollback_error = rollback_exc
+                elif xml_target.exists() and xml_source.exists():
+                    # XML duplicate from failed unlink
+                    if rollback_error is None:
+                        try:
+                            xml_target.unlink()
+                        except Exception as cleanup_exc:
+                            rollback_error = cleanup_exc
             message = f"Failed to move {source} to {target}: {exc}"
             if rollback_error is not None:
                 message += f"; rollback failed: {rollback_error}"
@@ -200,6 +225,7 @@ class ClassifierSession:
             )
 
         image_restored = False
+        xml_restored = False
         try:
             record.source.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(record.target), str(record.source))
@@ -207,13 +233,37 @@ class ClassifierSession:
             if record.xml_source is not None and record.xml_target is not None:
                 record.xml_source.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(record.xml_target), str(record.xml_source))
+                xml_restored = True
         except Exception as exc:
             rollback_error = None
+            # Rollback: if image was successfully restored, move it back
             if image_restored and record.source.exists() and not record.target.exists():
                 try:
                     shutil.move(str(record.source), str(record.target))
                 except Exception as rollback_exc:
                     rollback_error = rollback_exc
+            # Cleanup: if copy succeeded but unlink failed, remove the duplicate
+            elif record.source.exists() and record.target.exists():
+                try:
+                    record.source.unlink()
+                except Exception as cleanup_exc:
+                    rollback_error = cleanup_exc
+            # Handle XML duplicate cleanup
+            if record.xml_source is not None and record.xml_target is not None:
+                if xml_restored and record.xml_source.exists() and not record.xml_target.exists():
+                    # XML was restored, try to move it back
+                    if rollback_error is None:
+                        try:
+                            shutil.move(str(record.xml_source), str(record.xml_target))
+                        except Exception as rollback_exc:
+                            rollback_error = rollback_exc
+                elif record.xml_source.exists() and record.xml_target.exists():
+                    # XML duplicate from failed unlink
+                    if rollback_error is None:
+                        try:
+                            record.xml_source.unlink()
+                        except Exception as cleanup_exc:
+                            rollback_error = cleanup_exc
             message = f"Failed to undo move {record.target}: {exc}"
             if rollback_error is not None:
                 message += f"; rollback failed: {rollback_error}"
