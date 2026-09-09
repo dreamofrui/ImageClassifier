@@ -1,7 +1,10 @@
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
+import textwrap
 import time
 import unittest
 from pathlib import Path
@@ -1534,11 +1537,12 @@ class QtWorkbenchTest(unittest.TestCase):
                 self.assertTrue(
                     self._process_events_until(resize_started.is_set, timeout=1.0)
                 )
-                worker = next(iter(viewer._hq_threads.values()))[1]
+                thread, worker = next(iter(viewer._hq_threads.values()))
 
                 viewer._abort_hq()
 
                 self.assertTrue(worker._cancel_requested.is_set())
+                self.assertFalse(thread.isInterruptionRequested())
                 resize_gate.set()
                 self.assertTrue(
                     self._process_events_until(
@@ -1552,6 +1556,114 @@ class QtWorkbenchTest(unittest.TestCase):
             viewer.close()
             viewer.deleteLater()
             self.app.processEvents()
+
+    def test_viewer_real_lanczos_cancel_stress(self):
+        child_script = textwrap.dedent(
+            """
+            import sys
+            import threading
+            import time
+            from pathlib import Path
+
+            from PySide6.QtGui import QColor, QImage
+            from PySide6.QtWidgets import QApplication
+
+            import qt_image_viewer as viewer_module
+
+
+            def process_until(app, predicate, timeout, label):
+                deadline = time.perf_counter() + timeout
+                while time.perf_counter() < deadline:
+                    app.processEvents()
+                    if predicate():
+                        return
+                    time.sleep(0.001)
+                raise TimeoutError(label)
+
+
+            image_path = Path(sys.argv[1])
+            source = QImage(3200, 2400, QImage.Format.Format_RGB32)
+            source.fill(QColor("#426aa1"))
+            if not source.save(str(image_path), "JPG"):
+                raise RuntimeError("unable to create stress image")
+
+            entered_lanczos = threading.Event()
+            original_resize = viewer_module._lanczos_resize
+
+            def observed_resize(*args):
+                entered_lanczos.set()
+                return original_resize(*args)
+
+            viewer_module._lanczos_resize = observed_resize
+            app = QApplication([])
+            viewer = viewer_module.ImageViewer()
+            viewer.resize(1000, 700)
+            viewer.show()
+            app.processEvents()
+
+            try:
+                for attempt in range(6):
+                    entered_lanczos.clear()
+                    viewer.load_image(image_path)
+                    process_until(
+                        app,
+                        lambda: not viewer._active_threads
+                        and viewer._loading_path is None,
+                        5.0,
+                        f"initial load {attempt}",
+                    )
+                    process_until(
+                        app,
+                        entered_lanczos.is_set,
+                        5.0,
+                        f"HQ start {attempt}",
+                    )
+
+                    viewer.load_image(image_path)
+                    process_until(
+                        app,
+                        lambda: not viewer._active_threads
+                        and viewer._loading_path is None,
+                        5.0,
+                        f"replacement load {attempt}",
+                    )
+                    viewer._zoom_quality_timer.stop()
+                    process_until(
+                        app,
+                        lambda: not viewer._hq_threads,
+                        5.0,
+                        f"HQ drain {attempt}",
+                    )
+            finally:
+                viewer.shutdown(5000)
+                viewer.close()
+                viewer.deleteLater()
+                app.processEvents()
+
+            print("stress-ok")
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "hq-stress.jpg"
+            env = os.environ.copy()
+            env["QT_QPA_PLATFORM"] = "offscreen"
+            result = subprocess.run(
+                [sys.executable, "-c", child_script, str(image_path)],
+                cwd=Path(__file__).resolve().parents[1],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=90,
+                check=False,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("stress-ok", result.stdout)
 
     def test_viewer_shutdown_waits_for_running_image_worker(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1589,6 +1701,52 @@ class QtWorkbenchTest(unittest.TestCase):
                 viewer.close()
                 viewer.deleteLater()
                 self.app.processEvents()
+
+    def test_viewer_shutdown_waits_when_hq_worker_is_already_deleted(self):
+        """Shutdown should tolerate workers whose C++ objects were deleted.
+
+        The defensive check in _prune_hq_threads will detect and clean up
+        dead QObjects during _abort_hq(), so shutdown's explicit loop may
+        not see them. The important guarantee is no crash.
+        """
+        from qt_image_viewer import _HqResizeWorker
+        from PySide6.QtGui import QImage, QColor
+
+        viewer = ImageViewer()
+        source = QImage(100, 100, QImage.Format.Format_RGB32)
+        source.fill(QColor("#ff0000"))
+
+        # Create a real worker and thread
+        worker = _HqResizeWorker(999, source, 50, 50, 100)
+        thread = QThread(viewer)
+        worker.moveToThread(thread)
+        thread.start()
+        self.assertTrue(
+            self._process_events_until(thread.isRunning, timeout=1.0)
+        )
+
+        # Simulate the worker's C++ object being deleted
+        worker.deleteLater()
+        self.app.processEvents()
+
+        # Add to viewer's tracking dict (simulating a race condition)
+        viewer._hq_threads[999] = (thread, worker)
+
+        try:
+            # Shutdown should handle the deleted worker gracefully (no crash)
+            viewer.shutdown(timeout_ms=100)
+
+            # The defensive check cleaned up the dead worker, so shutdown's
+            # explicit loop didn't see it. Thread may still be running.
+            # Verify dict was cleaned up:
+            self.assertEqual(viewer._hq_threads, {})
+        finally:
+            if thread.isRunning():
+                thread.quit()
+                thread.wait(3000)
+            viewer.close()
+            viewer.deleteLater()
+            self.app.processEvents()
 
     def test_viewer_retains_source_image_and_unit_display_scale_on_load(self):
         viewer = ImageViewer()

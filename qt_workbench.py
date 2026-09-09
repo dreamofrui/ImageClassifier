@@ -43,6 +43,9 @@ from classifier_core import (
 )
 from qt_image_viewer import ImageViewer
 from qt_theme import APP_STYLESHEET
+from viewer_debug import get_debug_logger
+
+_debug = get_debug_logger()
 
 MIN_CLASSIFICATION_COLUMNS = 1
 MAX_CLASSIFICATION_COLUMNS = 4
@@ -694,6 +697,12 @@ class AnnotationWorkbench(QMainWindow):
         requested_index = min(
             self.session.current_index + 1, len(self.session.images) - 1
         )
+        _debug.log_operation(
+            "next_image",
+            current=self.session.current_index,
+            requested=requested_index,
+            total=len(self.session.images),
+        )
         self._set_current_image_index(requested_index, "Next image")
 
     def previous_image(self) -> None:
@@ -1214,7 +1223,16 @@ class AnnotationWorkbench(QMainWindow):
         self.delete_binding_profile(confirm=True)
 
     def classify(self, key: str, enforce_focus: bool = False) -> None:
+        _debug.log_operation(
+            "classify",
+            key=key,
+            enforce_focus=enforce_focus,
+            move_in_progress=self._move_in_progress,
+            has_session=bool(self.session),
+        )
+
         if self._move_in_progress:
+            _debug.log_state("classify", action="skip", reason="move_in_progress")
             self._set_status("Move already in progress")
             return
         if not self.session:
@@ -1222,6 +1240,7 @@ class AnnotationWorkbench(QMainWindow):
             return
         current = self.session.current_image()
         if current is not None and self.image_viewer.is_loading_path(current):
+            _debug.log_state("classify", action="skip", reason="image_loading")
             self._set_status("Image is still loading")
             return
         if enforce_focus:
@@ -1230,6 +1249,7 @@ class AnnotationWorkbench(QMainWindow):
         elif QApplication.activeModalWidget() is not None:
             return
 
+        _debug.log_state("classify", action="start_move", current_image=current.name if current else None)
         self._move_in_progress = True
         self._sync_move_controls_enabled()
         self._set_status("Moving image...")
@@ -1304,6 +1324,12 @@ class AnnotationWorkbench(QMainWindow):
 
     def _load_current_image(self) -> None:
         current = self.session.current_image() if self.session else None
+        _debug.log_operation(
+            "_load_current_image",
+            current=current.name if current else None,
+            previous=self._current_loaded_image.name if self._current_loaded_image else None,
+        )
+
         if current is None:
             self.image_viewer.clear(
                 "Batch complete. Select another source folder or undo the last move."
@@ -1313,8 +1339,11 @@ class AnnotationWorkbench(QMainWindow):
             return
 
         if current != self._current_loaded_image:
+            _debug.log_state("_load_current_image", action="load", path=current.name)
             self.image_viewer.load_image(current)
             self._current_loaded_image = current
+        else:
+            _debug.log_state("_load_current_image", action="skip", reason="already_loaded")
         self.setWindowTitle(f"ARS Image Annotation Workbench - {current.name}")
 
     def _update_progress(self) -> None:
@@ -1569,6 +1598,14 @@ class AnnotationWorkbench(QMainWindow):
         thread.start()
 
     def _handle_classify_finished(self, record: MoveRecord | None, error: object) -> None:
+        _debug.log_operation(
+            "_handle_classify_finished",
+            has_record=record is not None,
+            has_error=error is not None,
+            record_key=record.key if record else None,
+            record_category=record.category if record else None,
+        )
+
         self._move_in_progress = False
         self._sync_move_controls_enabled()
         if error is not None:
@@ -1585,6 +1622,7 @@ class AnnotationWorkbench(QMainWindow):
             return
 
         self._record_operation(self._format_move_record(record))
+        _debug.log_state("_handle_classify_finished", action="sync_after_session_change")
         self._sync_after_session_change(f"Moved to {record.category}")
 
     def _handle_undo_finished(self, record: MoveRecord | None, error: object) -> None:

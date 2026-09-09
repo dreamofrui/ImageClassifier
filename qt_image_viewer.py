@@ -10,6 +10,10 @@ from PySide6.QtWidgets import (
     QGraphicsView,
 )
 
+from viewer_debug import get_debug_logger
+
+_debug = get_debug_logger()
+
 
 def _qimage_raw_rgba_bytes(image: QImage) -> tuple[bytes, int, int]:
     """Return tightly packed RGBA8888 bytes plus width/height."""
@@ -66,9 +70,15 @@ class _ImageLoadWorker(QObject):
 
     @Slot()
     def run(self) -> None:
+        _debug.log_thread_event(
+            "ImageLoad.start", self._token, path=self._path.name
+        )
         try:
             image_data = self._path.read_bytes()
         except OSError as exc:
+            _debug.log_thread_event(
+                "ImageLoad.read_failed", self._token, error=str(exc)
+            )
             self.finished.emit(
                 self._path,
                 self._token,
@@ -79,6 +89,9 @@ class _ImageLoadWorker(QObject):
 
         image = QImage()
         if not image.loadFromData(image_data):
+            _debug.log_thread_event(
+                "ImageLoad.decode_failed", self._token, path=self._path.name
+            )
             self.finished.emit(
                 self._path,
                 self._token,
@@ -87,6 +100,9 @@ class _ImageLoadWorker(QObject):
             )
             return
 
+        _debug.log_thread_event(
+            "ImageLoad.success", self._token, size=f"{image.width()}x{image.height()}"
+        )
         self.finished.emit(self._path, self._token, image.copy(), "")
 
 
@@ -109,8 +125,12 @@ class _HqResizeWorker(QObject):
 
     @Slot()
     def run(self) -> None:
+        _debug.log_thread_event(
+            "HqResize.start", self._token, target=f"{self._width}x{self._height}"
+        )
         try:
             if self._cancel_requested.is_set():
+                _debug.log_thread_event("HqResize.cancelled_early", self._token)
                 self._source = QImage()
                 self.finished.emit(self._token, QImage(), 1.0, "cancelled")
                 return
@@ -119,16 +139,22 @@ class _HqResizeWorker(QObject):
             self._source = QImage()
 
             if self._cancel_requested.is_set():
+                _debug.log_thread_event("HqResize.cancelled_late", self._token)
                 self.finished.emit(self._token, QImage(), 1.0, "cancelled")
                 return
 
             if resized.isNull():
+                _debug.log_thread_event("HqResize.failed", self._token)
                 self.finished.emit(self._token, QImage(), 1.0, "HQ resize failed")
                 return
 
             display_scale = self._width / float(self._source_width)
+            _debug.log_thread_event(
+                "HqResize.success", self._token, scale=f"{display_scale:.3f}"
+            )
             self.finished.emit(self._token, resized, display_scale, "")
         except Exception as exc:  # noqa: BLE001 - surface to UI path
+            _debug.log_error(f"HqResize.exception token={self._token}", exc)
             self._source = QImage()
             self.finished.emit(self._token, QImage(), 1.0, str(exc))
 
@@ -199,6 +225,15 @@ class ImageViewer(QGraphicsView):
         token = self._load_token
         image_path = Path(path)
 
+        _debug.log_operation(
+            "load_image",
+            token=token,
+            path=image_path.name,
+            has_image=self._has_image,
+            active_threads=len(self._active_threads),
+            hq_threads=len(self._hq_threads),
+        )
+
         has_visible_image = self._has_image and not self._pixmap_item.pixmap().isNull()
         if not has_visible_image:
             self._has_image = False
@@ -214,6 +249,7 @@ class ImageViewer(QGraphicsView):
         self._set_message_visible(False)
 
         if self._active_threads:
+            _debug.log_state("load_image", action="defer", reason="active_threads")
             self._pending_load = (image_path, token)
             return
 
@@ -278,13 +314,20 @@ class ImageViewer(QGraphicsView):
         for thread, _worker in list(self._active_threads.values()):
             try:
                 thread.quit()
-                thread.wait(timeout_ms)
+                if not thread.wait(timeout_ms):
+                    thread.wait()
             except RuntimeError:
                 pass
-        for thread, _worker in list(self._hq_threads.values()):
+        self._active_threads.clear()
+        for thread, worker in list(self._hq_threads.values()):
+            try:
+                worker.cancel()
+            except RuntimeError:
+                pass
             try:
                 thread.quit()
-                thread.wait(timeout_ms)
+                if not thread.wait(timeout_ms):
+                    thread.wait()
             except RuntimeError:
                 pass
         self._hq_threads.clear()
@@ -320,13 +363,24 @@ class ImageViewer(QGraphicsView):
     def _handle_image_loaded(
         self, path: Path, token: int, image: QImage, error: str
     ) -> None:
+        _debug.log_operation(
+            "_handle_image_loaded",
+            token=token,
+            current_token=self._load_token,
+            path=path.name,
+            has_error=bool(error),
+            image_valid=not image.isNull(),
+        )
+
         if token != self._load_token:
+            _debug.log_state("_handle_image_loaded", action="ignore", reason="token_mismatch")
             return
 
         self._loading_path = None
         self._loading_token = None
 
         if error:
+            _debug.log_warning("Image load error", error=error)
             self._has_image = False
             self._source_image = None
             self._source_width = 0
@@ -343,18 +397,31 @@ class ImageViewer(QGraphicsView):
             preserved_effective = max(self.transform().m11(), 1e-6) * max(
                 self._display_scale, 1e-6
             )
+            _debug.log_state(
+                "_handle_image_loaded",
+                preserve_view=True,
+                preserved_effective=f"{preserved_effective:.4f}",
+            )
 
         self._source_image = image
         self._source_width = image.width()
         self._display_scale = 1.0
         self._abort_hq()
+
+        _debug.log_state(
+            "_handle_image_loaded",
+            action="create_pixmap",
+            size=f"{image.width()}x{image.height()}",
+        )
         pixmap = QPixmap.fromImage(self._source_image)
         self._pixmap_item.setPixmap(pixmap)
         self._pixmap_item.setOffset(0, 0)
         self._has_image = True
         self._set_message_visible(False)
         self.setSceneRect(QRectF(pixmap.rect()))
+
         if not self._preserve_view:
+            _debug.log_state("_handle_image_loaded", action="fit_to_window")
             self.fit_to_window()
         else:
             # Keep Zoom: restore the previous effective on-screen scale on the
@@ -362,12 +429,18 @@ class ImageViewer(QGraphicsView):
             # 0.4) is reset to 1.0 while view_scale stays ~1.0, so the image
             # jumps larger and the next HQ job targets a much bigger buffer.
             if preserved_effective is not None:
+                _debug.log_state(
+                    "_handle_image_loaded",
+                    action="restore_view",
+                    preserved=f"{preserved_effective:.4f}",
+                )
                 self._fit_mode = False
                 self.setTransform(
                     QTransform.fromScale(preserved_effective, preserved_effective)
                 )
             else:
                 # First image with Keep Zoom already on — still need a baseline.
+                _debug.log_state("_handle_image_loaded", action="fit_first_image")
                 self.fit_to_window()
                 return
             self._update_render_quality(interactive=False)
@@ -412,6 +485,11 @@ class ImageViewer(QGraphicsView):
 
     def _abort_hq(self) -> None:
         """Invalidate in-flight HQ and stop settle timer without blocking the UI."""
+        _debug.log_operation(
+            "_abort_hq",
+            old_token=self._hq_token,
+            active_hq=len(self._hq_threads),
+        )
         self._zoom_quality_timer.stop()
         self._hq_token += 1
         self._prune_hq_threads(request_stop=True)
@@ -425,22 +503,49 @@ class ImageViewer(QGraphicsView):
         except RuntimeError:
             return False
 
+    def _is_qobject_alive(self, obj) -> bool:
+        """Check if a Qt C++ object is still valid (not deleted by deleteLater)."""
+        if obj is None:
+            return False
+        try:
+            # Access a side-effect-free property to check if C++ object exists
+            _ = obj.objectName()
+            return True
+        except (RuntimeError, AttributeError):
+            # C++ object has been deleted or obj is not a QObject
+            return False
+
     def _prune_hq_threads(self, request_stop: bool = False) -> None:
         """Drop dead HQ thread entries; optionally ask live ones to stop."""
         for token, (thread, worker) in list(self._hq_threads.items()):
+            # Defensive check: C++ objects might be deleted by Qt
+            if not self._is_qobject_alive(thread) or not self._is_qobject_alive(worker):
+                _debug.log_warning(
+                    "Found deleted C++ QObject in _hq_threads (cleaned up)",
+                    token=token,
+                )
+                self._hq_threads.pop(token, None)
+                continue
+
             try:
                 running = thread.isRunning()
             except RuntimeError:
+                _debug.log_warning(
+                    "RuntimeError checking thread.isRunning() (cleaned up)",
+                    token=token,
+                )
                 self._hq_threads.pop(token, None)
                 continue
             if running:
                 if request_stop:
                     try:
                         worker.cancel()
-                        thread.requestInterruption()
                         thread.quit()
                     except RuntimeError:
-                        self._hq_threads.pop(token, None)
+                        _debug.log_warning(
+                            "RuntimeError requesting thread stop (ignored)",
+                            token=token,
+                        )
             else:
                 # Finished but not yet removed by the finished-slot race.
                 self._hq_threads.pop(token, None)
@@ -503,6 +608,13 @@ class ImageViewer(QGraphicsView):
         if pixmap.isNull() or not self._has_image:
             return
 
+        _debug.log_operation(
+            "_swap_pixmap_preserving_view",
+            old_scale=f"{self._display_scale:.4f}",
+            new_scale=f"{new_display_scale:.4f}",
+            pixmap_size=f"{pixmap.width()}x{pixmap.height()}",
+        )
+
         old_display_scale = max(self._display_scale, 1e-6)
         old_view_scale = max(self.transform().m11(), 1e-6)
         effective = old_view_scale * old_display_scale
@@ -511,21 +623,34 @@ class ImageViewer(QGraphicsView):
         # Must not use self.scale() here: transformationAnchor is AnchorUnderMouse,
         # so scale() after resetTransform() re-anchors under the cursor and jumps
         # the view (reads as an extra zoom/pan after idle settle).
-        anchor_view = self.viewport().rect().center()
-        anchor_scene = self.mapToScene(anchor_view)
-        source_x = anchor_scene.x() / old_display_scale
-        source_y = anchor_scene.y() / old_display_scale
+        try:
+            anchor_view = self.viewport().rect().center()
+            anchor_scene = self.mapToScene(anchor_view)
+            source_x = anchor_scene.x() / old_display_scale
+            source_y = anchor_scene.y() / old_display_scale
+            _debug.log_state(
+                "_swap_pixmap",
+                anchor=f"({source_x:.1f}, {source_y:.1f})",
+            )
+        except Exception as exc:
+            _debug.log_error("_swap_pixmap anchor calculation failed", exc)
+            raise
 
-        self._pixmap_item.setPixmap(pixmap)
-        self._pixmap_item.setOffset(0, 0)
-        self.setSceneRect(QRectF(pixmap.rect()))
-        self._display_scale = max(new_display_scale, 1e-6)
+        try:
+            self._pixmap_item.setPixmap(pixmap)
+            self._pixmap_item.setOffset(0, 0)
+            self.setSceneRect(QRectF(pixmap.rect()))
+            self._display_scale = max(new_display_scale, 1e-6)
 
-        new_view_scale = effective / self._display_scale
-        self.setTransform(QTransform.fromScale(new_view_scale, new_view_scale))
-        self.centerOn(
-            QPointF(source_x * self._display_scale, source_y * self._display_scale)
-        )
+            new_view_scale = effective / self._display_scale
+            self.setTransform(QTransform.fromScale(new_view_scale, new_view_scale))
+            self.centerOn(
+                QPointF(source_x * self._display_scale, source_y * self._display_scale)
+            )
+            _debug.log_state("_swap_pixmap", status="success")
+        except Exception as exc:
+            _debug.log_error("_swap_pixmap Qt operations failed", exc)
+            raise
 
     def _start_hq_resize(self) -> None:
         if (
@@ -544,6 +669,7 @@ class ImageViewer(QGraphicsView):
         # Cap concurrent HQ work. A stale job's finished handler schedules one
         # retry for the current image, avoiding a 140 ms polling loop.
         if self._hq_threads:
+            _debug.log_state("_start_hq_resize", action="skip", reason="thread_running")
             return
 
         target = self._target_hq_size()
@@ -556,6 +682,13 @@ class ImageViewer(QGraphicsView):
         token = self._hq_token
         source_copy = self._source_image.copy()
 
+        _debug.log_operation(
+            "_start_hq_resize",
+            token=token,
+            target=f"{target_w}x{target_h}",
+            source=f"{src_w}x{self._source_image.height()}",
+        )
+
         thread = QThread(self)
         worker = _HqResizeWorker(token, source_copy, target_w, target_h, src_w)
         worker.moveToThread(thread)
@@ -563,17 +696,31 @@ class ImageViewer(QGraphicsView):
         worker.finished.connect(self._handle_hq_resized)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        thread.finished.connect(thread.deleteLater)
+        # Don't use thread.deleteLater() here - manage lifecycle explicitly
         thread.finished.connect(
-            lambda finished_token=token: self._handle_hq_thread_finished(
-                finished_token
-            )
+            lambda finished_token=token: self._cleanup_hq_thread(finished_token)
         )
         self._hq_threads[token] = (thread, worker)
         thread.start()
 
-    def _handle_hq_thread_finished(self, token: int) -> None:
-        self._hq_threads.pop(token, None)
+    def _cleanup_hq_thread(self, token: int) -> None:
+        """Safely cleanup finished HQ thread with explicit lifecycle management."""
+        _debug.log_operation("_cleanup_hq_thread", token=token)
+
+        entry = self._hq_threads.pop(token, None)
+        if entry is None:
+            _debug.log_warning("_cleanup_hq_thread called but token not in dict", token=token)
+            return
+
+        thread, worker = entry
+
+        # Thread has finished; now safe to schedule C++ object deletion
+        try:
+            thread.deleteLater()
+        except RuntimeError:
+            _debug.log_warning("_cleanup_hq_thread: thread already deleted", token=token)
+
+        # Check if we need to schedule next HQ task
         if token == self._hq_token or self._hq_threads:
             return
         if self._has_image and self._loading_path is None:
@@ -583,15 +730,34 @@ class ImageViewer(QGraphicsView):
     def _handle_hq_resized(
         self, token: int, image: QImage, display_scale: float, error: str
     ) -> None:
+        _debug.log_operation(
+            "_handle_hq_resized",
+            token=token,
+            current_token=self._hq_token,
+            has_error=bool(error),
+            image_valid=not (image is None or image.isNull()),
+            has_image=self._has_image,
+        )
+
         if token != self._hq_token:
+            _debug.log_state("_handle_hq_resized", action="ignore", reason="token_mismatch")
             return
         if error or image is None or image.isNull():
+            _debug.log_state("_handle_hq_resized", action="skip", reason=error or "invalid_image")
             return
         if not self._has_image:
+            _debug.log_warning("_handle_hq_resized called but no image loaded")
             return
         if display_scale <= 0:
             src_w = max(self._source_width, 1)
             display_scale = image.width() / float(src_w)
+
+        _debug.log_state(
+            "_handle_hq_resized",
+            action="swap_pixmap",
+            scale=f"{display_scale:.4f}",
+            size=f"{image.width()}x{image.height()}",
+        )
         pixmap = QPixmap.fromImage(image)
         self._swap_pixmap_preserving_view(pixmap, display_scale)
 
@@ -607,6 +773,11 @@ class ImageViewer(QGraphicsView):
 
         if not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             # Cancel pending/running HQ so rapid next/prev does not pile up work.
+            _debug.log_operation(
+                "wheelEvent.navigation",
+                delta=delta_y,
+                direction="prev" if delta_y > 0 else "next",
+            )
             self._abort_hq()
             direction = -1 if delta_y > 0 else 1
             self.wheel_navigation_requested.emit(direction)
@@ -618,6 +789,7 @@ class ImageViewer(QGraphicsView):
         else:
             factor = 0.8
 
+        _debug.log_operation("wheelEvent.zoom", factor=factor)
         self.zoom_by(factor)
         event.accept()
 

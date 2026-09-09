@@ -127,7 +127,7 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **ARS** (795 symbols, 1728 relationships, 69 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **ImageClassifier** (903 symbols, 2005 relationships, 79 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
 
@@ -151,10 +151,10 @@ This project is indexed by GitNexus as **ARS** (795 symbols, 1728 relationships,
 
 | Resource | Use for |
 |----------|---------|
-| `gitnexus://repo/ARS/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/ARS/clusters` | All functional areas |
-| `gitnexus://repo/ARS/processes` | All execution flows |
-| `gitnexus://repo/ARS/process/{name}` | Step-by-step execution trace |
+| `gitnexus://repo/ImageClassifier/context` | Codebase overview, check index freshness |
+| `gitnexus://repo/ImageClassifier/clusters` | All functional areas |
+| `gitnexus://repo/ImageClassifier/processes` | All execution flows |
+| `gitnexus://repo/ImageClassifier/process/{name}` | Step-by-step execution trace |
 
 ## CLI
 
