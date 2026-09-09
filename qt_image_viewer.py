@@ -693,32 +693,43 @@ class ImageViewer(QGraphicsView):
         worker = _HqResizeWorker(token, source_copy, target_w, target_h, src_w)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+
+        # Critical: cleanup dict immediately when worker finishes, not when thread finishes
+        # This prevents race condition where _abort_hq → _prune_hq_threads tries to
+        # access thread/worker after quit() but before thread.finished fires
+        worker.finished.connect(
+            lambda finished_token=token: self._cleanup_hq_thread_early(finished_token)
+        )
         worker.finished.connect(self._handle_hq_resized)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
-        # Don't use thread.deleteLater() here - manage lifecycle explicitly
-        thread.finished.connect(
-            lambda finished_token=token: self._cleanup_hq_thread(finished_token)
-        )
+
+        # Thread cleanup only handles C++ object deletion
+        thread.finished.connect(thread.deleteLater)
+
         self._hq_threads[token] = (thread, worker)
         thread.start()
 
-    def _cleanup_hq_thread(self, token: int) -> None:
-        """Safely cleanup finished HQ thread with explicit lifecycle management."""
-        _debug.log_operation("_cleanup_hq_thread", token=token)
+    def _cleanup_hq_thread_early(self, token: int) -> None:
+        """
+        Remove finished worker from dict immediately when worker.finished fires.
+
+        This prevents race condition where:
+        1. worker.finished → thread.quit() (async, requests exit)
+        2. Another operation triggers _abort_hq() → _prune_hq_threads()
+        3. _prune sees token still in dict, tries to access thread during quit
+        4. Crash: accessing thread in undefined state
+
+        By removing from dict immediately, _prune won't see this token anymore.
+        """
+        _debug.log_operation("_cleanup_hq_thread_early", token=token)
 
         entry = self._hq_threads.pop(token, None)
         if entry is None:
-            _debug.log_warning("_cleanup_hq_thread called but token not in dict", token=token)
+            _debug.log_warning(
+                "_cleanup_hq_thread_early called but token not in dict", token=token
+            )
             return
-
-        thread, worker = entry
-
-        # Thread has finished; now safe to schedule C++ object deletion
-        try:
-            thread.deleteLater()
-        except RuntimeError:
-            _debug.log_warning("_cleanup_hq_thread: thread already deleted", token=token)
 
         # Check if we need to schedule next HQ task
         if token == self._hq_token or self._hq_threads:
