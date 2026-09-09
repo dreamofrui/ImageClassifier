@@ -527,6 +527,24 @@ class ImageViewer(QGraphicsView):
                 self._hq_threads.pop(token, None)
                 continue
 
+            # Check if thread has finished (covers quit() → finished transition window)
+            try:
+                if thread.isFinished():
+                    _debug.log_state(
+                        "_prune_hq_threads",
+                        action="cleanup_finished",
+                        token=token,
+                    )
+                    self._hq_threads.pop(token, None)
+                    continue
+            except RuntimeError:
+                _debug.log_warning(
+                    "RuntimeError checking thread.isFinished() (cleaned up)",
+                    token=token,
+                )
+                self._hq_threads.pop(token, None)
+                continue
+
             try:
                 running = thread.isRunning()
             except RuntimeError:
@@ -694,11 +712,12 @@ class ImageViewer(QGraphicsView):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
 
-        # Critical: cleanup dict immediately when worker finishes, not when thread finishes
-        # This prevents race condition where _abort_hq → _prune_hq_threads tries to
-        # access thread/worker after quit() but before thread.finished fires
+        # Critical: cleanup dict when worker finishes, not when thread finishes
+        # Use QueuedConnection to ensure callback runs in main thread (avoid cross-thread
+        # timer operations). _prune_hq_threads provides defense during callback delay.
         worker.finished.connect(
-            lambda finished_token=token: self._cleanup_hq_thread_early(finished_token)
+            lambda finished_token=token: self._cleanup_hq_thread_early(finished_token),
+            Qt.ConnectionType.QueuedConnection,
         )
         worker.finished.connect(self._handle_hq_resized)
         worker.finished.connect(thread.quit)
@@ -712,26 +731,27 @@ class ImageViewer(QGraphicsView):
 
     def _cleanup_hq_thread_early(self, token: int) -> None:
         """
-        Remove finished worker from dict immediately when worker.finished fires.
+        Remove finished worker from dict when worker.finished fires (via QueuedConnection).
 
-        This prevents race condition where:
-        1. worker.finished → thread.quit() (async, requests exit)
-        2. Another operation triggers _abort_hq() → _prune_hq_threads()
-        3. _prune sees token still in dict, tries to access thread during quit
-        4. Crash: accessing thread in undefined state
-
-        By removing from dict immediately, _prune won't see this token anymore.
+        This runs in main thread after worker completes. _prune_hq_threads may have
+        already removed the entry if it ran between worker.finished and this callback.
+        Both mechanisms work together - either can clean up, and we check scheduling
+        regardless of who removed the entry.
         """
         _debug.log_operation("_cleanup_hq_thread_early", token=token)
 
         entry = self._hq_threads.pop(token, None)
         if entry is None:
-            _debug.log_warning(
-                "_cleanup_hq_thread_early called but token not in dict", token=token
+            _debug.log_state(
+                "_cleanup_hq_thread_early",
+                action="already_removed",
+                token=token,
+                note="cleaned by _prune or duplicate callback",
             )
-            return
+            # Continue to check scheduling even if already removed
 
         # Check if we need to schedule next HQ task
+        # Only schedule if this was the current HQ token and no other HQ work is pending
         if token == self._hq_token or self._hq_threads:
             return
         if self._has_image and self._loading_path is None:

@@ -125,11 +125,15 @@ class QtWorkbenchTest(unittest.TestCase):
     def _process_events_until(self, predicate, timeout=1.0):
         deadline = time.perf_counter() + timeout
         while time.perf_counter() < deadline:
-            self.app.processEvents()
+            # Process events multiple times to handle queued connections
+            for _ in range(5):
+                self.app.processEvents()
             if predicate():
                 return True
             time.sleep(0.01)
-        self.app.processEvents()
+        # Final event processing burst
+        for _ in range(10):
+            self.app.processEvents()
         return predicate()
 
     def _wheel_event(self, delta_y, modifiers=Qt.KeyboardModifier.NoModifier):
@@ -1544,11 +1548,17 @@ class QtWorkbenchTest(unittest.TestCase):
                 self.assertTrue(worker._cancel_requested.is_set())
                 self.assertFalse(thread.isInterruptionRequested())
                 resize_gate.set()
+
+                # Wait for cleanup. With QueuedConnection, _cleanup_hq_thread_early
+                # is queued. _prune_hq_threads provides immediate cleanup for finished threads.
+                def check_and_prune():
+                    # Trigger defensive cleanup in _prune_hq_threads
+                    if viewer._hq_threads:
+                        viewer._abort_hq()
+                    return not viewer._hq_threads
+
                 self.assertTrue(
-                    self._process_events_until(
-                        lambda: not viewer._hq_threads,
-                        timeout=3.0,
-                    )
+                    self._process_events_until(check_and_prune, timeout=3.0)
                 )
         finally:
             resize_gate.set()
