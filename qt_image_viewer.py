@@ -187,6 +187,8 @@ class ImageViewer(QGraphicsView):
         self._display_scale = 1.0
         self._hq_token = 0
         self._hq_threads = {}
+        self._finished_hq_tokens = set()  # Thread-safe set for immediate completion marking
+        self._finished_lock = threading.Lock()  # Explicit lock for absolute safety
         self._max_hq_edge = 8192
         self._hq_scale_epsilon = 0.01
         self._zoom_quality_timer = QTimer(self)
@@ -492,6 +494,7 @@ class ImageViewer(QGraphicsView):
         )
         self._zoom_quality_timer.stop()
         self._hq_token += 1
+        self._cleanup_finished_hq_threads()  # Fast cleanup first
         self._prune_hq_threads(request_stop=True)
 
     def _thread_is_alive(self, thread: QThread) -> bool:
@@ -516,12 +519,33 @@ class ImageViewer(QGraphicsView):
             return False
 
     def _prune_hq_threads(self, request_stop: bool = False) -> None:
-        """Drop dead HQ thread entries; optionally ask live ones to stop."""
+        """
+        Defensive cleanup of HQ threads (last resort fallback).
+
+        In normal operation, _cleanup_finished_hq_threads() handles cleanup instantly.
+        This method is a fallback that only triggers when something unexpected happens.
+        """
+        # Fast cleanup should have already run, but ensure it's done
+        if not request_stop:
+            self._cleanup_finished_hq_threads()
+
+        # If dict is empty and we're not stopping threads, we're done
+        if not self._hq_threads and not request_stop:
+            return
+
         for token, (thread, worker) in list(self._hq_threads.items()):
-            # Defensive check: C++ objects might be deleted by Qt
+            # Request cancellation if needed
+            if request_stop:
+                try:
+                    if self._thread_is_alive(thread):
+                        worker.cancel()
+                except (RuntimeError, AttributeError):
+                    pass
+
+            # Defensive check: C++ objects might be deleted by Qt (should be rare now)
             if not self._is_qobject_alive(thread) or not self._is_qobject_alive(worker):
                 _debug.log_warning(
-                    "Found deleted C++ QObject in _hq_threads (cleaned up)",
+                    "Defensive cleanup caught orphaned C++ object (rare case)",
                     token=token,
                 )
                 self._hq_threads.pop(token, None)
@@ -681,8 +705,8 @@ class ImageViewer(QGraphicsView):
         ):
             return
 
-        # Drop finished / already-deleted C++ threads before deciding concurrency.
-        self._prune_hq_threads(request_stop=False)
+        # Fast cleanup of finished workers (no C++ calls, very efficient)
+        self._cleanup_finished_hq_threads()
 
         # Cap concurrent HQ work. A stale job's finished handler schedules one
         # retry for the current image, avoiding a 140 ms polling loop.
@@ -712,12 +736,11 @@ class ImageViewer(QGraphicsView):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
 
-        # Critical: cleanup dict when worker finishes, not when thread finishes
-        # Use QueuedConnection to ensure callback runs in main thread (avoid cross-thread
-        # timer operations). _prune_hq_threads provides defense during callback delay.
+        # Critical: Mark completion immediately in worker thread (zero delay)
+        # DirectConnection runs in worker thread, but only marks token in thread-safe set
         worker.finished.connect(
-            lambda finished_token=token: self._cleanup_hq_thread_early(finished_token),
-            Qt.ConnectionType.QueuedConnection,
+            lambda t=token: self._mark_hq_finished(t),
+            Qt.ConnectionType.DirectConnection,
         )
         worker.finished.connect(self._handle_hq_resized)
         worker.finished.connect(thread.quit)
@@ -729,33 +752,51 @@ class ImageViewer(QGraphicsView):
         self._hq_threads[token] = (thread, worker)
         thread.start()
 
-    def _cleanup_hq_thread_early(self, token: int) -> None:
+    def _mark_hq_finished(self, token: int) -> None:
         """
-        Remove finished worker from dict when worker.finished fires (via QueuedConnection).
+        Mark HQ worker as finished immediately (runs in worker thread via DirectConnection).
 
-        This runs in main thread after worker completes. _prune_hq_threads may have
-        already removed the entry if it ran between worker.finished and this callback.
-        Both mechanisms work together - either can clean up, and we check scheduling
-        regardless of who removed the entry.
+        This is called in the worker thread when worker.finished is emitted, providing
+        zero-delay marking. The actual dict cleanup happens later in main thread via
+        _cleanup_finished_hq_threads().
+
+        Thread safety: Uses explicit lock for absolute safety, though Python's GIL would
+        make set.add() atomic anyway.
         """
-        _debug.log_operation("_cleanup_hq_thread_early", token=token)
+        with self._finished_lock:
+            self._finished_hq_tokens.add(token)
 
-        entry = self._hq_threads.pop(token, None)
-        if entry is None:
-            _debug.log_state(
-                "_cleanup_hq_thread_early",
-                action="already_removed",
-                token=token,
-                note="cleaned by _prune or duplicate callback",
-            )
-            # Continue to check scheduling even if already removed
+    def _cleanup_finished_hq_threads(self) -> None:
+        """
+        Batch cleanup of all finished HQ workers (main thread only, very fast).
 
-        # Check if we need to schedule next HQ task
-        # Only schedule if this was the current HQ token and no other HQ work is pending
-        if token == self._hq_token or self._hq_threads:
+        This removes all tokens marked by _mark_hq_finished() from the dict.
+        No Qt C++ calls, no exception handling - just pure Python dict/set operations.
+        Safe to call frequently (e.g., on every _abort_hq or _start_hq_resize).
+        """
+        if not self._finished_hq_tokens:
             return
-        if self._has_image and self._loading_path is None:
-            self._schedule_hq_settle()
+
+        with self._finished_lock:
+            tokens_to_remove = list(self._finished_hq_tokens)
+            self._finished_hq_tokens.clear()
+
+        if not tokens_to_remove:
+            return
+
+        _debug.log_state(
+            "_cleanup_finished_hq_threads",
+            count=len(tokens_to_remove),
+            dict_size_before=len(self._hq_threads),
+        )
+
+        for token in tokens_to_remove:
+            self._hq_threads.pop(token, None)
+
+        _debug.log_state(
+            "_cleanup_finished_hq_threads",
+            dict_size_after=len(self._hq_threads),
+        )
 
     @Slot(int, object, float, str)
     def _handle_hq_resized(
@@ -770,11 +811,20 @@ class ImageViewer(QGraphicsView):
             has_image=self._has_image,
         )
 
+        # Always cleanup finished workers first, regardless of token match
+        self._cleanup_finished_hq_threads()
+
         if token != self._hq_token:
             _debug.log_state("_handle_hq_resized", action="ignore", reason="token_mismatch")
+            # Schedule next HQ if needed (this worker is done but was stale)
+            if not self._hq_threads and self._has_image and self._loading_path is None:
+                self._schedule_hq_settle()
             return
         if error or image is None or image.isNull():
             _debug.log_state("_handle_hq_resized", action="skip", reason=error or "invalid_image")
+            # Schedule retry on error
+            if not self._hq_threads and self._has_image and self._loading_path is None:
+                self._schedule_hq_settle()
             return
         if not self._has_image:
             _debug.log_warning("_handle_hq_resized called but no image loaded")
@@ -791,6 +841,10 @@ class ImageViewer(QGraphicsView):
         )
         pixmap = QPixmap.fromImage(image)
         self._swap_pixmap_preserving_view(pixmap, display_scale)
+
+        # Schedule next HQ task if needed (after this worker completes successfully)
+        if not self._hq_threads and self._has_image and self._loading_path is None:
+            self._schedule_hq_settle()
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         if not self._has_image:
