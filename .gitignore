@@ -35,3 +35,6 @@ ENV/
 *.spec.bak
 *.manifest
 *.exe
+
+# Debug log
+viewer_debug.log*
