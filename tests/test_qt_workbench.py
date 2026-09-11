@@ -1804,6 +1804,51 @@ class QtWorkbenchTest(unittest.TestCase):
             viewer.deleteLater()
             self.app.processEvents()
 
+    def test_hq_failure_retries_with_backoff_then_gives_up(self):
+        """A persistently failing HQ resize retries at most _HQ_RETRY_MAX times."""
+        calls = []
+
+        def failing_resize(source, width, height):
+            calls.append((width, height))
+            from PySide6.QtGui import QImage as QImg
+            return QImg()  # null result -> "HQ resize failed" error path
+
+        viewer = ImageViewer()
+        viewer.resize(400, 300)
+        viewer.show()
+        self.app.processEvents()
+        image = QImage(2000, 1000, QImage.Format.Format_RGB32)
+        image.fill(QColor("#5c4f8f"))
+        viewer._handle_image_loaded(Path("big.jpg"), viewer._load_token, image, "")
+        self.app.processEvents()
+        viewer._zoom_quality_timer.stop()
+
+        try:
+            with patch("qt_image_viewer._lanczos_resize", failing_resize):
+                viewer._finish_zoom_interaction()
+                # Drive retries to exhaustion (each retry fires the timer,
+                # which re-enters _finish_zoom_interaction). Generous timeout:
+                # backoff totals 140+280+560 = 980 ms plus slack.
+                self.assertTrue(
+                    self._process_events_until(
+                        lambda: len(calls) >= 4, timeout=5.0
+                    )
+                )
+                # Let any stray timers settle, then confirm no more retries.
+                time.sleep(0.7)
+                self.app.processEvents()
+                final_calls = len(calls)
+                time.sleep(0.7)
+                self.app.processEvents()
+                self.assertEqual(len(calls), final_calls)
+            # Budget was consumed and reset after giving up.
+            self.assertEqual(viewer._hq_retry_count, 0)
+        finally:
+            viewer.shutdown(500)
+            viewer.close()
+            viewer.deleteLater()
+            self.app.processEvents()
+
     def test_viewer_retains_source_image_and_unit_display_scale_on_load(self):
         viewer = ImageViewer()
         viewer.resize(800, 600)

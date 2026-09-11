@@ -162,6 +162,11 @@ class _HqResizeWorker(QObject):
 class ImageViewer(QGraphicsView):
     wheel_navigation_requested = Signal(int)
 
+    # Max retries for a failing HQ resize before giving up (exponential
+    # backoff 140/280/560 ms) -- a persistently failing resize must not
+    # re-run a full Lanczos every 140 ms forever.
+    _HQ_RETRY_MAX = 3
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._scene = QGraphicsScene(self)
@@ -200,6 +205,10 @@ class ImageViewer(QGraphicsView):
         self._zoom_quality_timer.setSingleShot(True)
         self._zoom_quality_timer.setInterval(140)
         self._zoom_quality_timer.timeout.connect(self._finish_zoom_interaction)
+        self._hq_retry_count = 0
+        self._hq_retry_timer = QTimer(self)
+        self._hq_retry_timer.setSingleShot(True)
+        self._hq_retry_timer.timeout.connect(self._finish_zoom_interaction)
 
         self.setScene(self._scene)
         self._scene.addItem(self._pixmap_item)
@@ -427,6 +436,7 @@ class ImageViewer(QGraphicsView):
         self._source_image = image
         self._source_width = image.width()
         self._display_scale = 1.0
+        self._hq_retry_count = 0  # new image: fresh retry budget
         self._abort_hq()
 
         _debug.log_state(
@@ -504,6 +514,24 @@ class ImageViewer(QGraphicsView):
             return
         self._zoom_quality_timer.start()
 
+    def _schedule_hq_retry(self) -> None:
+        """Retry a failed HQ resize with exponential backoff, then give up.
+
+        Without this, a persistently failing resize (PIL exception, null
+        result) re-ran a full Lanczos plus a main-thread full-frame copy
+        every 140 ms forever.
+        """
+        self._hq_retry_count += 1
+        if self._hq_retry_count > self._HQ_RETRY_MAX:
+            _debug.log_warning(
+                "HQ resize failed repeatedly; giving up",
+                attempts=self._hq_retry_count,
+            )
+            self._hq_retry_count = 0
+            return
+        interval_ms = 140 * (2 ** (self._hq_retry_count - 1))  # 140/280/560
+        self._hq_retry_timer.start(interval_ms)
+
     def _abort_hq(self) -> None:
         """Invalidate in-flight HQ and stop settle timer without blocking the UI."""
         _debug.log_operation(
@@ -512,6 +540,7 @@ class ImageViewer(QGraphicsView):
             active_hq=len(self._hq_threads),
         )
         self._zoom_quality_timer.stop()
+        self._hq_retry_timer.stop()
         self._hq_token += 1
         self._hq_active_token = None
         for _token, (thread, worker) in list(self._hq_threads.items()):
@@ -719,13 +748,13 @@ class ImageViewer(QGraphicsView):
             return
         if error or image is None or image.isNull():
             _debug.log_state("_handle_hq_resized", action="skip", reason=error or "invalid_image")
-            # Schedule retry on error
+            # Retry with backoff; gives up after _HQ_RETRY_MAX attempts.
             if (
                 self._hq_active_token is None
                 and self._has_image
                 and self._loading_path is None
             ):
-                self._schedule_hq_settle()
+                self._schedule_hq_retry()
             return
         if not self._has_image:
             _debug.log_warning("_handle_hq_resized called but no image loaded")
@@ -742,6 +771,7 @@ class ImageViewer(QGraphicsView):
         )
         pixmap = QPixmap.fromImage(image)
         self._swap_pixmap_preserving_view(pixmap, display_scale)
+        self._hq_retry_count = 0  # success: reset backoff for next failure
 
         # Schedule next HQ task if needed (after this worker completes successfully)
         if self._hq_active_token is None and self._has_image and self._loading_path is None:
