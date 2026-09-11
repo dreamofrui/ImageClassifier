@@ -1592,10 +1592,18 @@ class AnnotationWorkbench(QMainWindow):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda: self._clear_move_thread(thread))
+        # Bound slot (not a lambda): receiver affinity is explicitly self, so
+        # the queued call is guaranteed on the main thread; the identity guard
+        # inside prevents an old thread's late finished from clearing a newer
+        # move thread.
+        thread.finished.connect(self._handle_move_thread_finished)
         self._move_thread = thread
         self._move_worker = worker
         thread.start()
+
+    @Slot()
+    def _handle_move_thread_finished(self) -> None:
+        self._clear_move_thread(self.sender())
 
     def _handle_classify_finished(self, record: MoveRecord | None, error: object) -> None:
         _debug.log_operation(

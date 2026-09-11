@@ -272,17 +272,22 @@ class ImageViewer(QGraphicsView):
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(
-            lambda finished_token=token: self._handle_load_thread_finished(
-                finished_token
-            )
-        )
+        # Bound slot (not a lambda): receiver affinity is explicitly self, so
+        # the queued call is guaranteed to land on the main thread regardless
+        # of PySide's proxy-affinity semantics for plain callables. This keeps
+        # dict mutation and QThread construction single-threaded.
+        thread.finished.connect(self._handle_load_thread_finished)
 
         self._active_threads[token] = (thread, worker)
         thread.start()
 
-    def _handle_load_thread_finished(self, token: int) -> None:
-        self._active_threads.pop(token, None)
+    @Slot()
+    def _handle_load_thread_finished(self) -> None:
+        sender = self.sender()
+        for token, (thread, _worker) in list(self._active_threads.items()):
+            if thread is sender:
+                self._active_threads.pop(token, None)
+                break
         if self._shutting_down or self._pending_load is None:
             return
 
