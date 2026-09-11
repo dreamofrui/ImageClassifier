@@ -1676,84 +1676,130 @@ class QtWorkbenchTest(unittest.TestCase):
         self.assertIn("stress-ok", result.stdout)
 
     def test_viewer_shutdown_waits_for_running_image_worker(self):
+        """Shutdown with a worker stuck in file I/O: bounded wait, then clean exit.
+
+        The gate lives at the Path.read_bytes level, NOT by overriding run --
+        overriding run (the old flaky approach) makes PySide6 deliver the
+        started->run call on the MAIN thread, so the test never exercised
+        worker-thread behavior. With an unmodified @Slot run, the worker
+        genuinely blocks inside the worker thread.
+        """
+        entered = threading.Event()
+        gate = threading.Event()
+        io_threads = []
+
+        class _GatedPath(type(Path())):
+            def read_bytes(self):
+                io_threads.append(threading.current_thread().name)
+                entered.set()
+                gate.wait(3.0)
+                return super().read_bytes()
+
+        class _GatedLoadWorker(_ImageLoadWorker):
+            # Override the path, never run(): run must stay the base @Slot
+            # method so the queued started->run call lands in the worker thread.
+            def __init__(self, path, token):
+                super().__init__(path, token)
+                self._path = _GatedPath(self._path)
+
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "slow.bmp"
             image = QImage(80, 60, QImage.Format.Format_RGB32)
             image.fill(QColor("#426aa1"))
             self.assertTrue(image.save(str(path), "BMP"))
 
-            started = threading.Event()
-            gate = threading.Event()
-            original_run = _ImageLoadWorker.run
-
-            @Slot()
-            def slow_run(worker):
-                started.set()
-                gate.wait(1.0)
-                original_run(worker)
-
             viewer = ImageViewer()
             thread = None
             try:
-                with patch("qt_image_viewer._ImageLoadWorker.run", slow_run):
+                with patch("qt_image_viewer._ImageLoadWorker", _GatedLoadWorker):
                     viewer.load_image(path)
                     self.assertTrue(
-                        self._process_events_until(started.is_set, timeout=1.0)
+                        self._process_events_until(entered.is_set, timeout=1.0)
                     )
+                    # The gate must actually hold the WORKER thread, not main.
+                    self.assertNotIn("MainThread", io_threads)
                     thread = next(iter(viewer._active_threads.values()))[0]
-                    threading.Timer(0.2, gate.set).start()
-                    viewer.shutdown(timeout_ms=1)
-                    self.assertFalse(thread.isRunning())
+                    shutdown_started = time.monotonic()
+                    viewer.shutdown(timeout_ms=50)
+                    elapsed = time.monotonic() - shutdown_started
+                    # Bounded wait: returns without waiting for the gated worker.
+                    self.assertLess(elapsed, 1.0)
+                    # Dict is cleared regardless of the still-running thread.
+                    self.assertEqual(viewer._active_threads, {})
+                # Open the gate; the worker finishes and the thread exits.
+                gate.set()
+
+                def _thread_done():
+                    try:
+                        return not thread.isRunning()
+                    except RuntimeError:
+                        # C++ object already deleted by thread.finished ->
+                        # deleteLater: the cleanup chain ran to completion.
+                        return True
+
+                self.assertTrue(
+                    self._process_events_until(_thread_done, timeout=3.0)
+                )
             finally:
                 gate.set()
                 if thread is not None:
-                    thread.wait(3000)
+                    try:
+                        thread.wait(3000)
+                    except RuntimeError:
+                        pass  # C++ object already deleted: cleanup completed
                 viewer.close()
                 viewer.deleteLater()
                 self.app.processEvents()
 
-    def test_viewer_shutdown_waits_when_hq_worker_is_already_deleted(self):
-        """Shutdown should tolerate workers whose C++ objects were deleted.
+    def test_shutdown_bounded_wait_on_stuck_hq_worker(self):
+        """Shutdown must return promptly when an HQ resize is stuck mid-flight.
 
-        The defensive check in _prune_hq_threads will detect and clean up
-        dead QObjects during _abort_hq(), so shutdown's explicit loop may
-        not see them. The important guarantee is no crash.
+        Cancellation is cooperative (checked before/after _lanczos_resize), so
+        a resize blocked on a gate cannot be interrupted. shutdown() must use
+        a bounded wait and return without raising, leaving the thread to
+        finish on its own.
         """
-        from qt_image_viewer import _HqResizeWorker
-        from PySide6.QtGui import QImage, QColor
+        from qt_image_viewer import _lanczos_resize
+
+        gate = threading.Event()
+        resize_entered = threading.Event()
+
+        def gated_resize(source, width, height):
+            resize_entered.set()
+            gate.wait(3.0)
+            return source
 
         viewer = ImageViewer()
-        source = QImage(100, 100, QImage.Format.Format_RGB32)
-        source.fill(QColor("#ff0000"))
-
-        # Create a real worker and thread
-        worker = _HqResizeWorker(999, source, 50, 50, 100)
-        thread = QThread(viewer)
-        worker.moveToThread(thread)
-        thread.start()
-        self.assertTrue(
-            self._process_events_until(thread.isRunning, timeout=1.0)
-        )
-
-        # Simulate the worker's C++ object being deleted
-        worker.deleteLater()
+        image = QImage(2000, 1000, QImage.Format.Format_RGB32)
+        image.fill(QColor("#314f6e"))
+        viewer._handle_image_loaded(Path("big.jpg"), viewer._load_token, image, "")
         self.app.processEvents()
-
-        # Add to viewer's tracking dict (simulating a race condition)
-        viewer._hq_threads[999] = (thread, worker)
+        thread = None
 
         try:
-            # Shutdown should handle the deleted worker gracefully (no crash)
-            viewer.shutdown(timeout_ms=100)
-
-            # The defensive check cleaned up the dead worker, so shutdown's
-            # explicit loop didn't see it. Thread may still be running.
-            # Verify dict was cleaned up:
-            self.assertEqual(viewer._hq_threads, {})
+            with patch("qt_image_viewer._lanczos_resize", gated_resize):
+                viewer._finish_zoom_interaction()
+                self.assertTrue(
+                    self._process_events_until(
+                        resize_entered.is_set, timeout=3.0
+                    )
+                )
+                self.assertTrue(viewer._hq_threads)
+                thread = next(iter(viewer._hq_threads.values()))[0]
+                shutdown_started = time.monotonic()
+                viewer.shutdown(timeout_ms=50)
+                elapsed = time.monotonic() - shutdown_started
+                self.assertLess(elapsed, 1.0)
+                self.assertEqual(viewer._hq_threads, {})
+                self.assertIsNone(viewer._hq_active_token)
         finally:
-            if thread.isRunning():
-                thread.quit()
-                thread.wait(3000)
+            gate.set()
+            # Let the stuck thread finish so it is not destroyed while running.
+            if thread is not None:
+                try:
+                    thread.wait(3000)
+                except RuntimeError:
+                    pass  # C++ object already deleted: cleanup chain completed
             viewer.close()
             viewer.deleteLater()
             self.app.processEvents()
