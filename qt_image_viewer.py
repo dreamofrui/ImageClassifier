@@ -4,6 +4,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, QPointF, QRectF, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPixmap, QTransform, QWheelEvent
 from PySide6.QtWidgets import (
+    QApplication,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsTextItem,
@@ -106,61 +107,69 @@ class _ImageLoadWorker(QObject):
         self.finished.emit(self._path, self._token, image.copy(), "")
 
 
-class _HqResizeWorker(QObject):
-    finished = Signal(int, object, float, str)  # token, QImage, display_scale, error
+class _HqService(QObject):
+    """Persistent HQ resize worker living in one long-lived thread.
 
-    def __init__(
-        self, token: int, source: QImage, width: int, height: int, source_width: int
-    ):
-        super().__init__()
-        self._token = token
-        self._source = source
-        self._width = width
-        self._height = height
-        self._source_width = max(source_width, 1)
-        self._cancel_requested = threading.Event()
+    Replaces per-job _HqResizeWorker instances: no per-job QThread, no
+    deleteLater chains, no orphaned-wrapper state. Jobs are submitted via a
+    queued signal; cancellation is cooperative (checked before/after the
+    resize) via a threading.Event passed alongside the job.
+    """
 
-    def cancel(self) -> None:
-        self._cancel_requested.set()
+    jobFinished = Signal(int, object, float, str)  # token, QImage, display_scale, error
 
-    @Slot()
-    def run(self) -> None:
+    @Slot(int, QImage, int, int, int, object)
+    def submit(
+        self,
+        token: int,
+        source: QImage,
+        width: int,
+        height: int,
+        source_width: int,
+        cancel_event: threading.Event,
+    ) -> None:
         _debug.log_thread_event(
-            "HqResize.start", self._token, target=f"{self._width}x{self._height}"
+            "HqService.start", token, target=f"{width}x{height}"
         )
         try:
-            if self._cancel_requested.is_set():
-                _debug.log_thread_event("HqResize.cancelled_early", self._token)
-                self._source = QImage()
-                self.finished.emit(self._token, QImage(), 1.0, "cancelled")
+            if cancel_event.is_set():
+                _debug.log_thread_event("HqService.cancelled_early", token)
+                self.jobFinished.emit(token, QImage(), 1.0, "cancelled")
                 return
 
-            resized = _lanczos_resize(self._source, self._width, self._height)
-            self._source = QImage()
+            # Detach inside the worker thread. The main thread must treat
+            # _source_image as read-only while a job is in flight (QImage is
+            # implicitly shared; copy() here makes that safe).
+            local = source.copy()
+            resized = _lanczos_resize(local, width, height)
+            local = QImage()
+            source = QImage()
 
-            if self._cancel_requested.is_set():
-                _debug.log_thread_event("HqResize.cancelled_late", self._token)
-                self.finished.emit(self._token, QImage(), 1.0, "cancelled")
+            if cancel_event.is_set():
+                _debug.log_thread_event("HqService.cancelled_late", token)
+                self.jobFinished.emit(token, QImage(), 1.0, "cancelled")
                 return
 
             if resized.isNull():
-                _debug.log_thread_event("HqResize.failed", self._token)
-                self.finished.emit(self._token, QImage(), 1.0, "HQ resize failed")
+                _debug.log_thread_event("HqService.failed", token)
+                self.jobFinished.emit(token, QImage(), 1.0, "HQ resize failed")
                 return
 
-            display_scale = self._width / float(self._source_width)
+            display_scale = width / float(max(source_width, 1))
             _debug.log_thread_event(
-                "HqResize.success", self._token, scale=f"{display_scale:.3f}"
+                "HqService.success", token, scale=f"{display_scale:.3f}"
             )
-            self.finished.emit(self._token, resized, display_scale, "")
+            self.jobFinished.emit(token, resized, display_scale, "")
         except Exception as exc:  # noqa: BLE001 - surface to UI path
-            _debug.log_error(f"HqResize.exception token={self._token}", exc)
-            self._source = QImage()
-            self.finished.emit(self._token, QImage(), 1.0, str(exc))
+            _debug.log_error(f"HqService.exception token={token}", exc)
+            self.jobFinished.emit(token, QImage(), 1.0, str(exc))
 
 
 class ImageViewer(QGraphicsView):
     wheel_navigation_requested = Signal(int)
+
+    # Queued job submission to the persistent HQ service thread.
+    _hq_submit = Signal(int, QImage, int, int, int, object)
 
     # Max retries for a failing HQ resize before giving up (exponential
     # backoff 140/280/560 ms) -- a persistently failing resize must not
@@ -191,14 +200,19 @@ class ImageViewer(QGraphicsView):
         self._source_width = 0
         self._display_scale = 1.0
         self._hq_token = 0
-        # Thread tracking for shutdown(): entries live until thread.finished
-        # (NOT worker-finished -- the window between the two is exactly where
-        # a destroyed-but-running QThread caused crashes).
-        self._hq_threads = {}
+        # Persistent HQ service (lazily created in _ensure_hq_service).
+        # The QThread's parent is QApplication, NOT this widget: widget
+        # teardown can never destroy a running thread. This structurally
+        # eliminates the "destroyed while running" crash window.
+        self._hq_thread = None
+        self._hq_service = None
         # Single-flight state: the token of the one HQ job that is computing
         # or awaiting result delivery. Set in _start_hq_resize, cleared when
         # the job's finished signal reaches _handle_hq_resized.
         self._hq_active_token = None
+        # Cooperative cancellation for the in-flight job (threading.Event:
+        # pure Python, no C++ boundary cost from the main thread).
+        self._hq_cancel = None
         self._max_hq_edge = 8192
         self._hq_scale_epsilon = 0.01
         self._zoom_quality_timer = QTimer(self)
@@ -247,7 +261,7 @@ class ImageViewer(QGraphicsView):
             path=image_path.name,
             has_image=self._has_image,
             active_threads=len(self._active_threads),
-            hq_threads=len(self._hq_threads),
+            hq_busy=self.hq_busy,
         )
 
         has_visible_image = self._has_image and not self._pixmap_item.pixmap().isNull()
@@ -345,22 +359,26 @@ class ImageViewer(QGraphicsView):
             except (RuntimeError, AttributeError):
                 pass
         self._active_threads.clear()
-        for thread, worker in list(self._hq_threads.values()):
+        # One persistent HQ thread instead of a dict of per-job threads:
+        # cancel the in-flight job, then a single bounded wait.
+        if self._hq_thread is not None:
             try:
-                worker.cancel()
+                if not self._hq_thread.isRunning():
+                    pass  # already stopped; nothing to wait for
+                else:
+                    self._hq_thread.quit()
+                    if not self._hq_thread.wait(timeout_ms):
+                        # Leave it running: parent is QApplication so widget
+                        # teardown cannot destroy it; the late jobFinished is
+                        # discarded by the token check in _handle_hq_resized.
+                        _debug.log_error(
+                            "HQ service did not stop in time; leaving it "
+                            "running (it will finish on its own)"
+                        )
             except (RuntimeError, AttributeError):
                 pass
-            try:
-                thread.quit()
-                if not thread.wait(timeout_ms):
-                    _debug.log_warning(
-                        "HQ thread did not stop in time; leaving it running",
-                        timeout_ms=timeout_ms,
-                    )
-            except (RuntimeError, AttributeError):
-                pass
-        self._hq_threads.clear()
         self._hq_active_token = None
+        self._hq_cancel = None
 
     def fit_to_window(self) -> None:
         if not self._has_image:
@@ -537,30 +555,39 @@ class ImageViewer(QGraphicsView):
         _debug.log_operation(
             "_abort_hq",
             old_token=self._hq_token,
-            active_hq=len(self._hq_threads),
+            active_hq=self._hq_active_token,
         )
         self._zoom_quality_timer.stop()
         self._hq_retry_timer.stop()
         self._hq_token += 1
         self._hq_active_token = None
-        for _token, (thread, worker) in list(self._hq_threads.items()):
-            try:
-                worker.cancel()  # pure-Python Event.set -- no C++ boundary cost
-            except (RuntimeError, AttributeError):
-                self._hq_threads.pop(_token, None)
+        if self._hq_cancel is not None:
+            self._hq_cancel.set()  # pure-Python Event.set, no C++ boundary
+            self._hq_cancel = None
 
-    def _handle_hq_thread_finished(self) -> None:
-        """Pop the dict entry whose QThread just finished (queued to main thread).
+    def _ensure_hq_service(self) -> None:
+        """Lazily create the persistent HQ service thread (parent: QApplication)."""
+        if self._hq_service is not None:
+            # A stopped QThread can be restarted (verified on PySide6 6.11).
+            if not self._hq_thread.isRunning():
+                self._hq_thread.start()
+            return
+        app = QApplication.instance()
+        self._hq_thread = QThread(app)
+        self._hq_service = _HqService()
+        self._hq_service.moveToThread(self._hq_thread)
+        self._hq_submit.connect(
+            self._hq_service.submit, Qt.ConnectionType.QueuedConnection
+        )
+        self._hq_service.jobFinished.connect(
+            self._handle_hq_resized, Qt.ConnectionType.QueuedConnection
+        )
+        self._hq_thread.start()
 
-        Connected to thread.finished BEFORE thread.deleteLater, so the entry
-        is removed before the C++ object is destroyed in the same event-loop
-        pass -- a later stale lookup can never see a dead wrapper.
-        """
-        sender = self.sender()
-        for token, (thread, _worker) in list(self._hq_threads.items()):
-            if thread is sender:
-                self._hq_threads.pop(token, None)
-                return
+    @property
+    def hq_busy(self) -> bool:
+        """True while an HQ job is computing or awaiting result delivery."""
+        return self._hq_active_token is not None
 
     def _current_zoom_ratio(self) -> float:
         fit_scale = max(self._fit_scale, 0.01)
@@ -675,10 +702,8 @@ class ImageViewer(QGraphicsView):
         ):
             return
 
-        # Cap concurrent HQ work. A stale job's finished handler schedules one
-        # retry for the current image, avoiding a 140 ms polling loop.
-        # (_hq_threads is shutdown bookkeeping only -- entries outlive the job
-        # until thread.finished, so single-flight state lives in _hq_active_token.)
+        # Single-flight: a stale job's finished handler schedules one retry
+        # for the current image, avoiding a 140 ms polling loop.
         if self._hq_active_token is not None:
             _debug.log_state("_start_hq_resize", action="skip", reason="thread_running")
             return
@@ -691,7 +716,6 @@ class ImageViewer(QGraphicsView):
 
         self._hq_token += 1
         token = self._hq_token
-        source_copy = self._source_image.copy()
 
         _debug.log_operation(
             "_start_hq_resize",
@@ -700,24 +724,16 @@ class ImageViewer(QGraphicsView):
             source=f"{src_w}x{self._source_image.height()}",
         )
 
-        thread = QThread(self)
-        worker = _HqResizeWorker(token, source_copy, target_w, target_h, src_w)
-        worker.moveToThread(thread)
-        thread.started.connect(worker.run)
-        worker.finished.connect(self._handle_hq_resized)
-        worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
-
-        # Pop the tracking entry when the THREAD (not the worker) finishes, so
-        # shutdown() sees every still-running QThread. Bound slot with receiver
-        # self -> queued to the main thread. Ordered before thread.deleteLater
-        # so the entry is gone before the C++ object is destroyed.
-        thread.finished.connect(self._handle_hq_thread_finished)
-        thread.finished.connect(thread.deleteLater)
-
-        self._hq_threads[token] = (thread, worker)
+        self._ensure_hq_service()
         self._hq_active_token = token
-        thread.start()
+        self._hq_cancel = threading.Event()
+        # Pass the shared QImage reference; the service detaches with copy()
+        # inside the worker thread. The main thread must treat _source_image
+        # as read-only from here until the job finishes (QImage is implicitly
+        # shared, so concurrent read-only access is safe).
+        self._hq_submit.emit(
+            token, self._source_image, target_w, target_h, src_w, self._hq_cancel
+        )
 
     @Slot(int, object, float, str)
     def _handle_hq_resized(

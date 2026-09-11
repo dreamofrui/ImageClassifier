@@ -25,7 +25,7 @@ from PySide6.QtWidgets import QScrollArea
 
 from classifier_core import MoveRecord
 from config_manager import ConfigManager
-from qt_image_viewer import ImageViewer, _HqResizeWorker, _ImageLoadWorker
+from qt_image_viewer import ImageViewer, _HqService, _ImageLoadWorker
 from qt_theme import APP_STYLESHEET
 from qt_workbench import AnnotationWorkbench
 
@@ -1438,7 +1438,7 @@ class QtWorkbenchTest(unittest.TestCase):
 
             self.assertFalse(viewer._zoom_quality_timer.isActive())
             viewer._finish_zoom_interaction()
-            self.assertEqual(viewer._hq_threads, {})
+            self.assertFalse(viewer.hq_busy)
         finally:
             viewer._loading_path = None
             viewer.shutdown(3000)
@@ -1449,22 +1449,19 @@ class QtWorkbenchTest(unittest.TestCase):
     def test_hq_worker_cancellation_does_not_wrap_current_qthread(self):
         source = QImage(80, 60, QImage.Format.Format_RGB32)
         source.fill(QColor("#426aa1"))
-        worker = _HqResizeWorker(7, source, 40, 30, source.width())
+        service = _HqService()
         results = []
-        worker.finished.connect(lambda *args: results.append(args))
+        service.jobFinished.connect(lambda *args: results.append(args))
 
         class ForbiddenQThread:
             @staticmethod
             def currentThread():
                 raise AssertionError("HQ cancellation must not wrap the current QThread")
 
-        self.assertTrue(
-            hasattr(worker, "cancel"),
-            "HQ worker must expose a cancellation API that avoids QThread wrappers",
-        )
-        worker.cancel()
+        cancel_event = threading.Event()
+        cancel_event.set()
         with patch("qt_image_viewer.QThread", ForbiddenQThread):
-            worker.run()
+            service.submit(7, source, 40, 30, source.width(), cancel_event)
 
         self.assertEqual(len(results), 1)
         token, image, display_scale, error = results[0]
@@ -1476,7 +1473,7 @@ class QtWorkbenchTest(unittest.TestCase):
     def test_hq_worker_cancellation_after_resize_avoids_current_qthread(self):
         source = QImage(80, 60, QImage.Format.Format_RGB32)
         source.fill(QColor("#426aa1"))
-        worker = _HqResizeWorker(8, source, 40, 30, source.width())
+        service = _HqService()
         results = []
         resize_started = threading.Event()
         resize_gate = threading.Event()
@@ -1493,15 +1490,19 @@ class QtWorkbenchTest(unittest.TestCase):
             def currentThread():
                 raise AssertionError("HQ cancellation must not wrap the current QThread")
 
-        worker.finished.connect(lambda *args: results.append(args))
+        service.jobFinished.connect(lambda *args: results.append(args))
+        cancel_event = threading.Event()
         with (
             patch("qt_image_viewer.QThread", ForbiddenQThread),
             patch("qt_image_viewer._lanczos_resize", blocked_resize),
         ):
-            runner = threading.Thread(target=worker.run)
+            runner = threading.Thread(
+                target=service.submit,
+                args=(8, source, 40, 30, source.width(), cancel_event),
+            )
             runner.start()
             self.assertTrue(resize_started.wait(1.0))
-            worker.cancel()
+            cancel_event.set()
             resize_gate.set()
             runner.join(3.0)
 
@@ -1541,24 +1542,20 @@ class QtWorkbenchTest(unittest.TestCase):
                 self.assertTrue(
                     self._process_events_until(resize_started.is_set, timeout=1.0)
                 )
-                thread, worker = next(iter(viewer._hq_threads.values()))
+                cancel_event = viewer._hq_cancel
+                self.assertIsNotNone(cancel_event)
 
                 viewer._abort_hq()
 
-                self.assertTrue(worker._cancel_requested.is_set())
-                self.assertFalse(thread.isInterruptionRequested())
+                self.assertTrue(cancel_event.is_set())
+                self.assertFalse(viewer.hq_busy)
                 resize_gate.set()
 
-                # Wait for cleanup. With QueuedConnection, _cleanup_hq_thread_early
-                # is queued. _prune_hq_threads provides immediate cleanup for finished threads.
-                def check_and_prune():
-                    # Trigger defensive cleanup in _prune_hq_threads
-                    if viewer._hq_threads:
-                        viewer._abort_hq()
-                    return not viewer._hq_threads
-
+                # Job completes (cancelled) and active state stays cleared.
                 self.assertTrue(
-                    self._process_events_until(check_and_prune, timeout=3.0)
+                    self._process_events_until(
+                        lambda: not viewer.hq_busy, timeout=3.0
+                    )
                 )
         finally:
             resize_gate.set()
@@ -1640,7 +1637,7 @@ class QtWorkbenchTest(unittest.TestCase):
                     viewer._zoom_quality_timer.stop()
                     process_until(
                         app,
-                        lambda: not viewer._hq_threads,
+                        lambda: not viewer.hq_busy,
                         5.0,
                         f"HQ drain {attempt}",
                     )
@@ -1774,7 +1771,7 @@ class QtWorkbenchTest(unittest.TestCase):
         image.fill(QColor("#314f6e"))
         viewer._handle_image_loaded(Path("big.jpg"), viewer._load_token, image, "")
         self.app.processEvents()
-        thread = None
+        hq_thread = None
 
         try:
             with patch("qt_image_viewer._lanczos_resize", gated_resize):
@@ -1784,22 +1781,24 @@ class QtWorkbenchTest(unittest.TestCase):
                         resize_entered.is_set, timeout=3.0
                     )
                 )
-                self.assertTrue(viewer._hq_threads)
-                thread = next(iter(viewer._hq_threads.values()))[0]
+                self.assertTrue(viewer.hq_busy)
+                hq_thread = viewer._hq_thread
+                self.assertIsNotNone(hq_thread)
                 shutdown_started = time.monotonic()
                 viewer.shutdown(timeout_ms=50)
                 elapsed = time.monotonic() - shutdown_started
                 self.assertLess(elapsed, 1.0)
-                self.assertEqual(viewer._hq_threads, {})
                 self.assertIsNone(viewer._hq_active_token)
+                # Thread is left running (parent is QApplication, not the
+                # widget) and will finish after the gate opens.
         finally:
             gate.set()
             # Let the stuck thread finish so it is not destroyed while running.
-            if thread is not None:
+            if hq_thread is not None:
                 try:
-                    thread.wait(3000)
+                    hq_thread.wait(3000)
                 except RuntimeError:
-                    pass  # C++ object already deleted: cleanup chain completed
+                    pass
             viewer.close()
             viewer.deleteLater()
             self.app.processEvents()
@@ -1902,7 +1901,7 @@ class QtWorkbenchTest(unittest.TestCase):
 
         settled = self._process_events_until(
             lambda: viewer._pixmap_item.pixmap().width() != source_w
-            and not viewer._hq_threads,
+            and not viewer.hq_busy,
             timeout=3.0,
         )
         post_w = viewer._pixmap_item.pixmap().width()
@@ -1926,7 +1925,7 @@ class QtWorkbenchTest(unittest.TestCase):
 
         viewer._finish_zoom_interaction()
         self._process_events_until(
-            lambda: abs(viewer._display_scale - 1.0) > 1e-6 or not viewer._hq_threads,
+            lambda: abs(viewer._display_scale - 1.0) > 1e-6 or not viewer.hq_busy,
             timeout=3.0,
         )
 
@@ -1955,7 +1954,7 @@ class QtWorkbenchTest(unittest.TestCase):
         effective_before = viewer.transform().m11() * viewer._display_scale
 
         viewer._finish_zoom_interaction()
-        self._process_events_until(lambda: not viewer._hq_threads, timeout=3.0)
+        self._process_events_until(lambda: not viewer.hq_busy, timeout=3.0)
         # If HQ applied, display_scale may change; product must match.
         effective_after = viewer.transform().m11() * viewer._display_scale
 
@@ -1992,7 +1991,7 @@ class QtWorkbenchTest(unittest.TestCase):
 
         viewer._finish_zoom_interaction()
         settled = self._process_events_until(
-            lambda: abs(viewer._display_scale - 1.0) > 1e-6 or not viewer._hq_threads,
+            lambda: abs(viewer._display_scale - 1.0) > 1e-6 or not viewer.hq_busy,
             timeout=3.0,
         )
         self.assertTrue(settled)
@@ -2025,7 +2024,7 @@ class QtWorkbenchTest(unittest.TestCase):
         self.app.processEvents()
         viewer.zoom_by(2.0)
         viewer._finish_zoom_interaction()
-        self._process_events_until(lambda: not viewer._hq_threads, timeout=3.0)
+        self._process_events_until(lambda: not viewer.hq_busy, timeout=3.0)
         effective_kept = viewer.transform().m11() * viewer._display_scale
 
         image2 = QImage(2500, 1500, QImage.Format.Format_RGB32)
@@ -2059,26 +2058,9 @@ class QtWorkbenchTest(unittest.TestCase):
         self.assertIsNone(viewer._target_hq_size())
         viewer._finish_zoom_interaction()
         self.app.processEvents()
-        self.assertEqual(viewer._hq_threads, {})
+        self.assertFalse(viewer.hq_busy)
         self.assertEqual(viewer._pixmap_item.pixmap().width(), 200)
 
-        viewer.close()
-        viewer.deleteLater()
-        self.app.processEvents()
-
-    def test_viewer_abort_hq_tolerates_deleted_thread_wrappers(self):
-        viewer = ImageViewer()
-        # Simulate a finished HQ thread whose C++ object was already deleteLater'd
-        # while the Python wrapper is still tracked in _hq_threads.
-        dead_thread = QThread(viewer)
-        dead_thread.deleteLater()
-        self.app.processEvents()
-        viewer._hq_threads[999] = (dead_thread, None)
-
-        viewer._abort_hq()
-        viewer.load_image  # keep attribute access for readability
-        # Must not raise; entry should be pruned.
-        self.assertNotIn(999, viewer._hq_threads)
         viewer.close()
         viewer.deleteLater()
         self.app.processEvents()
