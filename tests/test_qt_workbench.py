@@ -1672,6 +1672,125 @@ class QtWorkbenchTest(unittest.TestCase):
         )
         self.assertIn("stress-ok", result.stdout)
 
+    def test_shutdown_during_inflight_hq_never_destroys_running_thread(self):
+        """Repeated shutdown-while-HQ-running must never trigger Qt's
+        'QThread: Destroyed while thread is still running' abort.
+
+        Subprocess stress: loop load -> settle (HQ starts) -> shutdown
+        mid-flight -> deleteLater, with a message handler collecting every
+        Qt warning. The persistent service thread (parent: QApplication)
+        must outlive every viewer.
+        """
+        child_script = textwrap.dedent(
+            """
+            import sys
+            import time
+            from pathlib import Path
+
+            from PySide6.QtCore import qInstallMessageHandler
+            from PySide6.QtGui import QColor, QImage
+            from PySide6.QtWidgets import QApplication
+
+            import qt_image_viewer as viewer_module
+
+            qt_messages = []
+
+
+            def message_handler(msg_type, context, message):
+                qt_messages.append(message)
+                # Default handler prints; keep it for stderr visibility.
+                from PySide6.QtCore import QtMsgType
+                if msg_type in (QtMsgType.QtCriticalMsg, QtMsgType.QtFatalMsg):
+                    sys.stderr.write(message + "\\n")
+
+
+            image_path = Path(sys.argv[1])
+            source = QImage(1600, 1200, QImage.Format.Format_RGB32)
+            source.fill(QColor("#426aa1"))
+            if not source.save(str(image_path), "JPG"):
+                raise RuntimeError("unable to create stress image")
+
+            qInstallMessageHandler(message_handler)
+            app = QApplication([])
+
+            def process_until(predicate, timeout, label):
+                deadline = time.perf_counter() + timeout
+                while time.perf_counter() < deadline:
+                    app.processEvents()
+                    if predicate():
+                        return
+                    time.sleep(0.001)
+                raise TimeoutError(label)
+
+
+            for cycle in range(50):
+                viewer = viewer_module.ImageViewer()
+                viewer.resize(800, 600)
+                viewer.show()
+                app.processEvents()
+                try:
+                    viewer.load_image(image_path)
+                    process_until(
+                        lambda: not viewer._active_threads
+                        and viewer._loading_path is None,
+                        5.0,
+                        f"load {cycle}",
+                    )
+                    # Start an HQ job.
+                    viewer._finish_zoom_interaction()
+                    process_until(
+                        lambda: viewer.hq_busy, 5.0, f"HQ start {cycle}"
+                    )
+                    # Shutdown immediately, possibly mid-resize.
+                    viewer.shutdown(timeout_ms=50)
+                    viewer.close()
+                    viewer.deleteLater()
+                    app.processEvents()
+                except Exception:
+                    viewer.shutdown(3000)
+                    raise
+
+            # Let any in-flight resizes finish before inspecting messages.
+            deadline = time.perf_counter() + 5.0
+            while time.perf_counter() < deadline:
+                app.processEvents()
+                time.sleep(0.01)
+
+            bad = [
+                m
+                for m in qt_messages
+                if "Destroyed while thread is still running" in m
+                or "Cannot create children" in m
+                or "Cannot queue arguments of type" in m
+            ]
+            if bad:
+                raise AssertionError(f"forbidden Qt messages: {bad}")
+
+            print("shutdown-stress-ok")
+            """
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp) / "hq-shutdown-stress.jpg"
+            env = os.environ.copy()
+            env["QT_QPA_PLATFORM"] = "offscreen"
+            result = subprocess.run(
+                [sys.executable, "-c", child_script, str(image_path)],
+                cwd=Path(__file__).resolve().parents[1],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}",
+        )
+        self.assertIn("shutdown-stress-ok", result.stdout)
+
     def test_viewer_shutdown_waits_for_running_image_worker(self):
         """Shutdown with a worker stuck in file I/O: bounded wait, then clean exit.
 
